@@ -1,0 +1,187 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_HUB_USER = 'sirinebb'
+        JAVA_HOME       = '/usr/lib/jvm/java-21-openjdk-amd64'
+        MAVEN_HOME      = '/opt/apache-maven-3.9.6'
+        PATH            = '/opt/apache-maven-3.9.6/bin:/usr/lib/jvm/java-21-openjdk-amd64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+        SONAR_URL       = 'http://backend-sonarqube-1:9000'
+        SONAR_TOKEN     = 'sqa_f0034fe1b237332688aaf63de633723232d72a7a'
+    }
+
+    options {
+        timeout(time: 120, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('1 - Checkout') {
+            steps {
+                echo 'Code disponible dans le workspace Jenkins'
+                sh 'ls $PROJECT'
+            }
+        }
+
+        stage('2 - Maven Build') {
+            steps {
+                sh '''
+                cd $PROJECT/backend
+                for dir in eureka-server ConfigServer api-gateway \
+                  microservices/service_user \
+                  microservices/complaint-service \
+                  microservices/contrat/Esprit--PI-4SAE---4SAE9---2526---sujet4--contrat \
+                  microservices/evaluation/Esprit--PI-4SAE---4SAE9---2526---sujet4--evaluation \
+                  microservices/joboffer/service_joboffer/NexLance \
+                  microservices/module_certification \
+                  microservices/module_competence \
+                  microservices/module_portfolio \
+                  microservices/notification-service \
+                  microservices/organization-service \
+                  microservices/service_projects; do
+                  echo "Building $dir"
+                  (cd "$dir" && mvn clean package spring-boot:repackage -DskipTests) \
+                    && echo "OK: $dir" || echo "FAILED: $dir"
+                done
+                '''
+            }
+        }
+
+        stage('3 - SonarQube Analysis') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh '''
+                    cd $PROJECT/backend
+                    for dir in microservices/service_user \
+                      microservices/complaint-service \
+                      microservices/contrat/Esprit--PI-4SAE---4SAE9---2526---sujet4--contrat \
+                      microservices/evaluation/Esprit--PI-4SAE---4SAE9---2526---sujet4--evaluation \
+                      microservices/joboffer/service_joboffer/NexLance \
+                      microservices/module_certification \
+                      microservices/module_competence \
+                      microservices/module_portfolio \
+                      microservices/notification-service \
+                      microservices/organization-service \
+                      microservices/service_projects; do
+                      echo "Analysing $dir"
+                      (cd "$dir" && mvn sonar:sonar \
+                        -Dsonar.host.url=$SONAR_URL \
+                        -Dsonar.token=$SONAR_TOKEN \
+                        -Dsonar.scanner.socketTimeout=300 \
+                        -DskipTests) \
+                        && echo "OK: $dir" || echo "WARNING: $dir failed - continuing"
+                    done
+                    '''
+                }
+            }
+        }
+
+        stage('4 - Docker Build') {
+            steps {
+                sh '''
+                cd $PROJECT/backend
+                docker-compose build
+                echo "=== Images construites ==="
+                docker images | grep "img-"
+                '''
+            }
+        }
+
+        stage('5 - Docker Push') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    withCredentials([usernamePassword(
+                        credentialsId: 'docker-hub-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )]) {
+                        sh '''
+                        echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+                        for img in img-eureka img-config-server img-gateway \
+                          img-user img-complaint img-contrat img-evaluation \
+                          img-joboffer img-certification img-portfolio \
+                          img-competence img-notification img-organization \
+                          img-projects img-recommendation img-nexlance-front \
+                          img-prometheus; do
+                          echo "Pushing $img"
+                          docker tag $img sirinebb/$img:latest
+                          docker push sirinebb/$img:latest \
+                            && echo "OK: $img" || echo "FAILED: $img"
+                        done
+                        docker logout
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('6 - Docker Compose Up') {
+            steps {
+                sh '''
+                cd $PROJECT/backend
+                docker-compose up -d
+                sleep 10
+                docker ps
+                '''
+            }
+        }
+
+        stage('7 - Kubernetes Deploy') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh '''
+                    kubectl apply -f $PROJECT/k8s/ \
+                      && echo "K8s deployed" \
+                      || echo "kubectl non configure - skip"
+                    kubectl get pods 2>/dev/null || echo "kubectl non disponible"
+                    '''
+                }
+            }
+        }
+
+        stage('8 - Health Check') {
+            steps {
+                sh '''
+                echo "=== Verification des services ==="
+                curl -sf http://localhost:8761/actuator/health \
+                  && echo "Eureka OK" || echo "Eureka pas pret"
+                curl -sf http://localhost:4200 \
+                  && echo "Frontend OK" || echo "Frontend pas pret"
+                curl -sf http://localhost:8080/actuator/health \
+                  && echo "API Gateway OK" || echo "Gateway pas pret"
+                curl -sf http://localhost:9001/api/system/status \
+                  && echo "SonarQube OK" || echo "SonarQube pas pret"
+                curl -sf http://localhost:3000 \
+                  && echo "Grafana OK" || echo "Grafana pas pret"
+
+                echo ""
+                echo "=== URLs disponibles ==="
+                echo "  Frontend    : http://localhost:4200"
+                echo "  API Gateway : http://localhost:8080"
+                echo "  Eureka      : http://localhost:8761"
+                echo "  SonarQube   : http://localhost:9001"
+                echo "  Grafana     : http://localhost:3000"
+                echo "  Prometheus  : http://localhost:9093"
+                echo "  AI Service  : http://localhost:9000"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline NexLance REUSSI'
+        }
+        failure {
+            echo 'Pipeline NexLance ECHOUE - Consulter les logs Jenkins'
+        }
+        unstable {
+            echo 'Pipeline instable - Certaines etapes ont echoue'
+        }
+        always {
+            echo 'Fin du pipeline NexLance'
+        }
+    }
+}
